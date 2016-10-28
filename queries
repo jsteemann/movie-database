@@ -1,0 +1,194 @@
+/* very simple single-collection query that returns all movies that have 
+   "Lord.*Rings" in their title */
+
+FOR movie IN Movie
+  FILTER movie.title =~ "Lord.*Rings"
+
+  RETURN {
+    /* return just the movie title */ 
+    movie: movie.title
+  }
+
+
+
+
+/* query that returns all movies that have "Lord.*Rings" in their title,
+   including their genres and actors as horizontal arrays. this query
+   uses two subqueries for each movie */
+
+FOR movie IN Movie
+  FILTER movie.title =~ "Lord.*Rings"
+ 
+  /* retrieve genres from Relation collection */
+  LET genres = ( 
+    FOR r IN Relation
+      /* join the Relation collection via the movie id */
+      /* only use relations of type "has_genre" here */
+      FILTER r._from == movie._id && r.type == "has_genre"
+      RETURN DOCUMENT(r._to).name
+  )
+  
+  /* retrieve actors from Relation collection */
+  LET actors = ( 
+    FOR r IN Relation  
+      /* join the Relation collection via the movie id */
+      /* only use relations of type "acted_in" here */
+      FILTER r._to == movie._id && r.type == "acted_in"
+      LET actor = DOCUMENT(r._from)
+      RETURN { name: actor.name, born: actor.born }
+  )
+ 
+  RETURN { 
+    movie: movie.title, 
+    genres, 
+    actors
+  }
+
+
+
+
+/* query to return all actors named "Kevin" along with the movies they
+   acted in and their movie role */
+
+FOR actor IN Person
+  FILTER actor.name =~ "^Kevin"
+
+  /* join the Relation collection via the actor id */
+  FOR acted IN Relation
+    FILTER acted.type == 'acted_in'
+    FILTER acted._from == actor._id
+
+    RETURN { 
+      actor: actor.name, 
+      movie: DOCUMENT(acted._to).title, 
+      role: acted.role 
+    }
+
+
+
+
+/* query to return all actors named "Kevin" along with the movies they
+   acted in, plus more information about the movies.
+   this query uses a graph traversal of depth 1..2 (direct connections)
+   starting at each found actor */
+
+FOR actor IN Person
+  FILTER actor.name =~ "^Kevin"
+
+  /* start outbound graph traversal from each found actor */
+  FOR v, e, p IN 1..2 OUTBOUND actor._id Relation
+    /* only process paths that start with an 'acted_in' relation 
+       from actor to movie */
+
+    FILTER p.edges[0].type == 'acted_in'
+    FILTER e.type != 'has_keyword'
+
+    /* create some temporary variables for easier processing later */
+
+    /* second last vertex in path */
+    LET subject = p.vertices[-2]
+    /* label for second last vertex in path */
+    LET subjectType = SUBSTRING(subject._id, 0, CONTAINS(subject._id, '/', true))
+
+    /* last vertex in path */
+    LET object = p.vertices[-1]
+    /* label for last vertex in path */
+    LET objectType = SUBSTRING(object._id, 0, CONTAINS(object._id, '/', true))
+
+    /* path length (will be 1 or 2) */    
+    LET level = LENGTH(p.edges)
+
+    RETURN { 
+      level,
+      subjectType,
+      subject: subject.name,
+      type: e.type, 
+      objectType,
+      object: object.name,
+      role: objectType == 'Movie' ? e.role : "-" 
+    }   
+
+
+
+/* query to return the movies that Hugo Weaving acted in, along with his
+   co-actors */
+
+FOR actor IN Person
+  FILTER actor.name =~ "Hugo Weaving"
+
+  /* start an outbound graph traversal from the actor to find the actor's movies */
+  FOR movie, rel IN 1..1 OUTBOUND actor._id Relation
+    /* only process 'acted_in' relations */
+    FILTER rel.type == 'acted_in'
+
+    /* now that we have a movie, we start an inbound (backwards) traversal
+       from the movie to its actors */
+    LET coActors = (FOR v, e, p IN 1..1 INBOUND movie._id Relation
+      /* only process 'acted_in' relations */
+      FILTER e.type == 'acted_in'
+
+      /* exclude Hugo Weaving himself here */
+      FILTER v._id != actor._id
+
+      RETURN v.name
+    )
+
+    RETURN {
+      movie: movie.title,
+      role: rel.role,
+      coActors
+    }
+
+
+
+
+/* query to find all connections between persons named "John" and persons
+   whose names start with "Br" (e.g. Brian, Brad...). this will run a
+   graph traversal from each found person and follow all relations of type
+   'acted_in', 'directed', 'writer_of', 'produced'. this will limit the
+   result to persons. this will find direct and indirect connections between
+   persons. indirect connections will be found up to a path length of 6.
+*/
+
+FOR from IN Person
+  FILTER from.name =~ "^John"
+
+  FOR v, e, p IN 1..6 ANY from Relation
+    /* only process edges that have to do with persons */
+    FILTER p.edges[*].type ALL IN [ 'acted_in', 'directed', 'writer_of', 'produced' ]
+
+    /* name in last vertex should start with 'Br' */
+    FILTER p.vertices[-1].name =~ '^Br'
+
+    /* create result, the 'via' attribute is built using a subquery that
+       transforms the found path into human-readable strings */
+    LET result = {
+      person: from.name,
+      connectedTo: p.vertices[-1].name,
+      via: (
+        FOR i IN 0..LENGTH(p.edges) - 1
+          LET pv = p.vertices[i]
+          LET pvt = pv.name
+          LET cvt = p.vertices[i + 1].name
+          LET cet = p.edges[i].type
+          LET direction = p.edges[i]._from == pv._id ? 1 : 0
+          RETURN direction ? CONCAT(pvt, ' (', cet, ') ', cvt) : CONCAT(cvt, ' (', cet, ') ', pvt)
+      )
+    }
+
+    /* we may have found multiple connections between two persons.
+       we now use COLLECT to group the result by the two found persons' 
+       names */
+    COLLECT 
+      person = result.person, 
+      connectedTo = result.connectedTo 
+    INTO via = result.via
+
+    /* final result. for each pair of two persons, we return the connection
+       between them that has the shortest path length */
+    RETURN {
+      person,
+      connectedTo,
+      via: (FOR x IN via SORT LENGTH(x) LIMIT 1 RETURN x)
+    }
+
